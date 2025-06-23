@@ -1,2 +1,2 @@
 # Cheminformatics
-This repository contains small weekend-projects that I find interesting and areas that I am exploring
+This repository contains small computational chemistry related weekend-projects that I find interesting and areas that I am exploring

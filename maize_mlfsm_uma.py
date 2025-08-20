@@ -15,8 +15,6 @@ class OptimizeGeometryAtoms(Node):
     def run(self) -> None:
         from ase.io import read, write  # lazy import
         atoms = self.atoms_in.receive()
-        if self.workdir.value:
-            os.makedirs(self.workdir.value, exist_ok=True)
         import torch
         from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
         from ase.optimize import FIRE
@@ -65,8 +63,6 @@ class RunMLFSM(Node):
 
     # I/O
     workdir: Parameter[str] = Parameter(default="work_fsm")
-    vfile_dir_name: Parameter[str] = Parameter(default="fsm_outputs")
-
     vfile_dir: Output[str] = Output()
 
     def _align_to(self, A, B):
@@ -88,7 +84,8 @@ class RunMLFSM(Node):
         from ase.io import write
 
         os.makedirs(self.workdir.value, exist_ok=True)
-        vdir = os.path.join(self.workdir.value, self.vfile_dir_name.value)
+        print("WORKDIR: %s",self.workdir.value)
+        vdir = self.workdir.value
         os.makedirs(vdir, exist_ok=True)
         self.logger.info(f"MLFSM writing outputs under: {vdir}")
         
@@ -245,7 +242,6 @@ if __name__ == "__main__":
 
     mlfsm = flow.add(RunMLFSM, name="mlfsm_run", parameters=dict(
         workdir=os.path.join(args.workdir, "fsm"),
-        vfile_dir_name=args.vdir_name,
         interp=args.interp,
         nnodes_min=args.nnodes_min,
         ninterp=args.ninterp,

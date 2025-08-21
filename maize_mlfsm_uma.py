@@ -3,17 +3,21 @@ import os
 from maize.core.interface import Parameter, Output, Input
 from maize.core.node import Node
 
+
 class OptimizeGeometryAtoms(Node):
     """
     Receive ASE Atoms and return optimized ASE Atoms.
     """
+
     atoms_in: Input["ASEAtoms"] = Input()
     method: Parameter[str] = Parameter(default="uma")
     fmax: Parameter[float] = Parameter(default=0.05)
     workdir: Parameter[str] = Parameter(default="work_opt")
     atoms_out: Output["ASEAtoms"] = Output()
+
     def run(self) -> None:
         from ase.io import read, write  # lazy import
+
         atoms = self.atoms_in.receive()
         import torch
         from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
@@ -36,16 +40,10 @@ class OptimizeGeometryAtoms(Node):
         optimized = _optimize(fmax, atoms, calc)
         self.atoms_out.send(optimized)
 
+
 class RunMLFSM(Node):
     """
-    Run ML-FSM (UMA-m) starting from optimized ASE Atoms and write stacked vfile*.xyz.
-
-    Steps:
-      1) Align product to reactant (rigid trans/rot)
-      2) Load UMA-m calculator
-      3) Build FreezingString(reactant, product, nnodes_min, interp, ninterp)
-      4) Grow + optimize using RIC optimizer
-      5) Write string
+    Run ML-FSM (UMA-m) starting from optimized ASE Atoms.
     """
 
     reactant: Input["ASEAtoms"] = Input()
@@ -68,6 +66,7 @@ class RunMLFSM(Node):
     def _align_to(self, A, B):
         """Align structure A to B via rigid transform using project_trans_rot."""
         from mlfsm.geom import project_trans_rot
+
         Apos = A.get_positions()
         Bpos = B.get_positions()
         _, A_aligned = project_trans_rot(Bpos, Apos)  # project A onto B frame
@@ -84,11 +83,11 @@ class RunMLFSM(Node):
         from ase.io import write
 
         os.makedirs(self.workdir.value, exist_ok=True)
-        print("WORKDIR: %s",self.workdir.value)
+        print("WORKDIR: %s", self.workdir.value)
         vdir = self.workdir.value
         os.makedirs(vdir, exist_ok=True)
         self.logger.info(f"MLFSM writing outputs under: {vdir}")
-        
+
         # Receive optimized endpoints
         r = self.reactant.receive()
         p = self.product.receive()
@@ -103,7 +102,8 @@ class RunMLFSM(Node):
 
         # Build the string
         string = FreezingString(
-            r, p,
+            r,
+            p,
             int(self.nnodes_min.value),
             str(self.interp.value),
             int(self.ninterp.value),
@@ -119,7 +119,7 @@ class RunMLFSM(Node):
                 int(self.maxls.value),
                 float(self.dmax.value),
             )
-            #run fsm
+            # run fsm
             while string.growing:
                 string.grow()
                 string.optimize(optimizer)
@@ -132,6 +132,7 @@ class ExtractTSFromVfiles(Node):
     """Pick a TS guess from a directory of vfile*.xyz files.
     Uses your read_vfile() logic on the LAST vfile (sorted order).
     """
+
     vfiles_dir_in: Input[str] = Input()
     filename_prefix: Parameter[str] = Parameter(default="vfile")
     filename_suffix: Parameter[str] = Parameter(default=".xyz")
@@ -142,6 +143,7 @@ class ExtractTSFromVfiles(Node):
 
     def _read_vfile(self, path: str):
         from ase.io import read, write  # type: ignore
+
         frames = read(path, format="xyz", index=":")
         with open(path, "r") as f:
             data = f.readlines()
@@ -162,11 +164,14 @@ class ExtractTSFromVfiles(Node):
 
         vdir = self.vfiles_dir_in.receive()
         os.makedirs(self.workdir.value, exist_ok=True)
-        out_path = os.path.join(self.workdir.value, os.path.basename(self.ts_out_path.value))
+        out_path = os.path.join(
+            self.workdir.value, os.path.basename(self.ts_out_path.value)
+        )
 
         # Find the last vfile in sorted order
         files = sorted(
-            f for f in glob(os.path.join(vdir, "*"))
+            f
+            for f in glob(os.path.join(vdir, "*"))
             if os.path.basename(f).startswith(self.filename_prefix.value)
             and os.path.basename(f).endswith(self.filename_suffix.value)
         )
@@ -184,56 +189,70 @@ class ExtractTSFromVfiles(Node):
         self.ts_guess_path.send(out_path)
         self.ts_atoms_object.send(frames[ts_idx])
 
+
 class _PrintPath(Node):
     inp: Input[str] = Input()
+
     def run(self) -> None:
         p = self.inp.receive()
         self.logger.info("TS guess written to: %s", p)
 
+
 class RunPRFO(Node):
     import os
+
     ts_guess_atoms: Input["ASEAtoms"] = Input()
     ts_loc: Input[str] = Input()
     ts_out: Output[str] = Output()
-        
-    def _writetsqcin(self,structure,filename,chg,mult):
+
+    def _writetsqcin(self, structure, filename, chg, mult):
         chem_symb = structure.get_chemical_symbols()
-        #method='wb97X-V'
-        #basis='def2-TZVP'
-        method = 'B3LYP'
-        basis = '6-31g(d)'
+        # method='wb97X-V'
+        # basis='def2-TZVP'
+        method = "B3LYP"
+        basis = "6-31g(d)"
         coordinates = structure.get_positions()
-        with open(filename,'w') as f:
-            f.write(f'$molecule\n{chg} {mult}\n')
+        with open(filename, "w") as f:
+            f.write(f"$molecule\n{chg} {mult}\n")
             for i in range(len(chem_symb)):
                 f.write(chem_symb[i])
-                f.write(' ')
+                f.write(" ")
                 for coord in coordinates[i]:
                     f.write(str(coord))
-                    f.write(' ')
-                f.write('\n')
-            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
-                    'basis {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n@@@\n\n'.format(method,basis))
-            f.write('$rem\nJOBTYPE       TS\nMETHOD       {}\n'
-                    'BASIS       {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\ngeom_opt_hessian read\nscf_guess read\n'
-                    'mem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS       FALSE\n$end\n\n$molecule\nread\n$end\n\n@@@\n\n'.format(method,basis))
-            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
-                    'basis {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n$molecule\nread\n$end\n'.format(method,basis))
-    
+                    f.write(" ")
+                f.write("\n")
+            f.write(
+                "$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n"
+                "basis {}\n"
+                "scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n"
+                "WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n@@@\n\n".format(method, basis)
+            )
+            f.write(
+                "$rem\nJOBTYPE       TS\nMETHOD       {}\n"
+                "BASIS       {}\n"
+                "scf_max_cycles 250\ngeom_opt_max_cycles 250\ngeom_opt_hessian read\nscf_guess read\n"
+                "mem_total 40000\nmem_static 6000\n"
+                "WAVEFUNCTION_ANALYSIS       FALSE\n$end\n\n$molecule\nread\n$end\n\n@@@\n\n".format(
+                    method, basis
+                )
+            )
+            f.write(
+                "$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n"
+                "basis {}\n"
+                "scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n"
+                "WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n$molecule\nread\n$end\n".format(
+                    method, basis
+                )
+            )
+
     def run(self) -> None:
         ts_guess = self.ts_guess_atoms.receive()
         filename = self.ts_loc.receive()
-        filename = filename+".qcin"
-        
-        self._writetsqcin(ts_guess,filename,0,1)
+        filename = filename + ".qcin"
+
+        self._writetsqcin(ts_guess, filename, 0, 1)
         os.system(f"qchem -nt 8 {filename} {filename}.out")
-        self.ts_out.send(f'{filename}.out')
+        self.ts_out.send(f"{filename}.out")
 
 
 # build and run
@@ -245,64 +264,100 @@ if __name__ == "__main__":
     class _FeedAtoms(Node):
         path: Parameter[str] = Parameter()
         out: Output["ASEAtoms"] = Output()
+
         def run(self) -> None:
             from ase.io import read
+
             atoms = read(self.path.value)
             self.out.send(atoms)
 
-    parser = argparse.ArgumentParser(description="MAIZE TS workflow with UMA-m and ML-FSM")
-    parser.add_argument("--reactant", required=True, help="Path to reactant structure (xyz/traj)")
-    parser.add_argument("--product", required=True, help="Path to product structure (xyz/traj)")
+    parser = argparse.ArgumentParser(
+        description="MAIZE TS workflow with UMA-m and ML-FSM"
+    )
+    parser.add_argument(
+        "--reactant", required=True, help="Path to reactant structure (xyz/traj)"
+    )
+    parser.add_argument(
+        "--product", required=True, help="Path to product structure (xyz/traj)"
+    )
     parser.add_argument("--workdir", default="work", help="Root working directory")
-    parser.add_argument("--ts-out", default="ts_guess.xyz", help="Filename for TS guess (written in ts workdir)")
+    parser.add_argument(
+        "--ts-out",
+        default="ts_guess.xyz",
+        help="Filename for TS guess (written in ts workdir)",
+    )
 
     # OptimizeGeometryAtoms
-    parser.add_argument("--fmax", type=float, default=0.05, help="FIRE force threshold (eV/Å)")
+    parser.add_argument(
+        "--fmax", type=float, default=0.05, help="FIRE force threshold (eV/Å)"
+    )
 
     # RunMLFSM controls
-    parser.add_argument("--interp", choices=["ric","lst","cart"], default="ric")
+    parser.add_argument("--interp", choices=["ric", "lst", "cart"], default="ric")
     parser.add_argument("--nnodes-min", type=int, default=18)
     parser.add_argument("--ninterp", type=int, default=50)
-    parser.add_argument("--method", choices=["L-BFGS-B","CG"], default="L-BFGS-B")
+    parser.add_argument("--method", choices=["L-BFGS-B", "CG"], default="L-BFGS-B")
     parser.add_argument("--maxls", type=int, default=3)
     parser.add_argument("--maxiter", type=int, default=2)
     parser.add_argument("--dmax", type=float, default=0.05)
     parser.add_argument("--interpolate-only", action="store_true")
-    parser.add_argument("--vdir-name", default="fsm_outputs", help="Subdirectory name for vfile outputs")
+    parser.add_argument(
+        "--vdir-name", default="fsm_outputs", help="Subdirectory name for vfile outputs"
+    )
 
     args = parser.parse_args()
 
     # Build the graph
     flow = Workflow(name="ts_search_with_mlfsm")
 
-    feedR = flow.add(_FeedAtoms, name="feed_reactant", parameters=dict(path=args.reactant))
-    feedP = flow.add(_FeedAtoms, name="feed_product", parameters=dict(path=args.product))
+    feedR = flow.add(
+        _FeedAtoms, name="feed_reactant", parameters=dict(path=args.reactant)
+    )
+    feedP = flow.add(
+        _FeedAtoms, name="feed_product", parameters=dict(path=args.product)
+    )
 
-    optR = flow.add(OptimizeGeometryAtoms, name="opt_reactant", parameters=dict(
-        fmax=args.fmax,
-        workdir=os.path.join(args.workdir, "opt_reactant"),
-    ))
-    optP = flow.add(OptimizeGeometryAtoms, name="opt_product", parameters=dict(
-        fmax=args.fmax,
-        workdir=os.path.join(args.workdir, "opt_product"),
-    ))
+    optR = flow.add(
+        OptimizeGeometryAtoms,
+        name="opt_reactant",
+        parameters=dict(
+            fmax=args.fmax,
+            workdir=os.path.join(args.workdir, "opt_reactant"),
+        ),
+    )
+    optP = flow.add(
+        OptimizeGeometryAtoms,
+        name="opt_product",
+        parameters=dict(
+            fmax=args.fmax,
+            workdir=os.path.join(args.workdir, "opt_product"),
+        ),
+    )
 
-    mlfsm = flow.add(RunMLFSM, name="mlfsm_run", parameters=dict(
-        workdir=os.path.join(args.workdir, "fsm"),
-        interp=args.interp,
-        nnodes_min=args.nnodes_min,
-        ninterp=args.ninterp,
-        method=args.method,
-        maxls=args.maxls,
-        maxiter=args.maxiter,
-        dmax=args.dmax,
-        interpolate_only=args.interpolate_only,
-    ))
+    mlfsm = flow.add(
+        RunMLFSM,
+        name="mlfsm_run",
+        parameters=dict(
+            workdir=os.path.join(args.workdir, "fsm"),
+            interp=args.interp,
+            nnodes_min=args.nnodes_min,
+            ninterp=args.ninterp,
+            method=args.method,
+            maxls=args.maxls,
+            maxiter=args.maxiter,
+            dmax=args.dmax,
+            interpolate_only=args.interpolate_only,
+        ),
+    )
 
-    extract = flow.add(ExtractTSFromVfiles, name="extract_ts", parameters=dict(
-        workdir=os.path.join(args.workdir, "ts"),
-        ts_out_path=args.ts_out,
-    ))
+    extract = flow.add(
+        ExtractTSFromVfiles,
+        name="extract_ts",
+        parameters=dict(
+            workdir=os.path.join(args.workdir, "ts"),
+            ts_out_path=args.ts_out,
+        ),
+    )
 
     printer = flow.add(_PrintPath, name="print_ts_path")
     prfo = flow.add(RunPRFO, name="run_prfo")
@@ -313,10 +368,10 @@ if __name__ == "__main__":
     flow.connect(optR.atoms_out, mlfsm.reactant)
     flow.connect(optP.atoms_out, mlfsm.product)
     flow.connect(mlfsm.vfile_dir, extract.vfiles_dir_in)
-#     flow.connect(extract.ts_guess_path, printer.inp)
+    #     flow.connect(extract.ts_guess_path, printer.inp)
     flow.connect(extract.ts_guess_path, prfo.ts_loc)
-    flow.connect(extract.ts_atoms_object,prfo.ts_guess_atoms)
-    flow.connect(prfo.ts_out,printer.inp)
+    flow.connect(extract.ts_atoms_object, prfo.ts_guess_atoms)
+    flow.connect(prfo.ts_out, printer.inp)
 
     # Run
     flow.check()
@@ -324,4 +379,6 @@ if __name__ == "__main__":
 
     print("=== Finished ===")
     print(f"Vfiles directory: {os.path.join(args.workdir, 'fsm', args.vdir_name)}")
-    print(f"TS guess path:    {os.path.join(args.workdir, 'ts', os.path.basename(args.ts_out))}")
+    print(
+        f"TS guess path:    {os.path.join(args.workdir, 'ts', os.path.basename(args.ts_out))}"
+    )

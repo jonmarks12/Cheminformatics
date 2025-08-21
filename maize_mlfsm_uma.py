@@ -138,6 +138,7 @@ class ExtractTSFromVfiles(Node):
     ts_out_path: Parameter[str] = Parameter(default="ts_guess.xyz")
     workdir: Parameter[str] = Parameter(default="work_ts")
     ts_guess_path: Output[str] = Output()
+    ts_atoms_object: Output["ASEAtoms"] = Output()
 
     def _read_vfile(self, path: str):
         from ase.io import read, write  # type: ignore
@@ -181,12 +182,58 @@ class ExtractTSFromVfiles(Node):
         ts_idx = max(range(len(energies)), key=lambda i: energies[i])
         write(out_path, frames[ts_idx])
         self.ts_guess_path.send(out_path)
+        self.ts_atoms_object.send(frames[ts_idx])
 
 class _PrintPath(Node):
     inp: Input[str] = Input()
     def run(self) -> None:
         p = self.inp.receive()
         self.logger.info("TS guess written to: %s", p)
+
+class RunPRFO(Node):
+    import os
+    ts_guess_atoms: Input["ASEAtoms"] = Input()
+    ts_loc: Input[str] = Input()
+    ts_out: Output[str] = Output()
+        
+    def _writetsqcin(self,structure,filename,chg,mult):
+        chem_symb = structure.get_chemical_symbols()
+        #method='wb97X-V'
+        #basis='def2-TZVP'
+        method = 'B3LYP'
+        basis = '6-31g(d)'
+        coordinates = structure.get_positions()
+        with open(filename,'w') as f:
+            f.write(f'$molecule\n{chg} {mult}\n')
+            for i in range(len(chem_symb)):
+                f.write(chem_symb[i])
+                f.write(' ')
+                for coord in coordinates[i]:
+                    f.write(str(coord))
+                    f.write(' ')
+                f.write('\n')
+            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
+                    'basis {}\n'
+                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
+                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n@@@\n\n'.format(method,basis))
+            f.write('$rem\nJOBTYPE       TS\nMETHOD       {}\n'
+                    'BASIS       {}\n'
+                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\ngeom_opt_hessian read\nscf_guess read\n'
+                    'mem_total 40000\nmem_static 6000\n'
+                    'WAVEFUNCTION_ANALYSIS       FALSE\n$end\n\n$molecule\nread\n$end\n\n@@@\n\n'.format(method,basis))
+            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
+                    'basis {}\n'
+                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
+                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n$molecule\nread\n$end\n'.format(method,basis))
+    
+    def run(self) -> None:
+        ts_guess = self.ts_guess_atoms.receive()
+        filename = self.ts_loc.receive()
+        filename = filename+".qcin"
+        
+        self._writetsqcin(ts_guess,filename,0,1)
+        os.system(f"qchem -nt 8 {filename} {filename}.out")
+        self.ts_out.send(f'{filename}.out')
 
 
 # build and run
@@ -258,6 +305,7 @@ if __name__ == "__main__":
     ))
 
     printer = flow.add(_PrintPath, name="print_ts_path")
+    prfo = flow.add(RunPRFO, name="run_prfo")
 
     # Wire it up
     flow.connect(feedR.out, optR.atoms_in)
@@ -265,7 +313,10 @@ if __name__ == "__main__":
     flow.connect(optR.atoms_out, mlfsm.reactant)
     flow.connect(optP.atoms_out, mlfsm.product)
     flow.connect(mlfsm.vfile_dir, extract.vfiles_dir_in)
-    flow.connect(extract.ts_guess_path, printer.inp)
+#     flow.connect(extract.ts_guess_path, printer.inp)
+    flow.connect(extract.ts_guess_path, prfo.ts_loc)
+    flow.connect(extract.ts_atoms_object,prfo.ts_guess_atoms)
+    flow.connect(prfo.ts_out,printer.inp)
 
     # Run
     flow.check()

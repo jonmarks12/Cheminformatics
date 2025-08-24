@@ -2,9 +2,10 @@ from maize.core.interface import Parameter, Output, Input, MultiInput
 from maize.core.node import Node
 import os
 from mlfsm.cos import FreezingString
-from mlfsm.opt import InternalsOptimizer
+from mlfsm.opt import CartesianOptimizer
 from mlfsm.geom import project_trans_rot
 import numpy as np
+import ase
 
 class RunMLFSM(Node):
     """
@@ -18,9 +19,11 @@ class RunMLFSM(Node):
     Outputs:
         -TS Guess: ase.Atoms
     """
-    reactant_product = MultiInput["ASEAtoms"](n_ports=2)
+    reactant = Input["ase.Atoms"]()
+    product = Input["ase.Atoms"]()
     calculator = Input["ASECalculator"]()
     run_directory = Output[str]()
+    ts_out = Output[str]()
         
     nnodes_min: Parameter[int] = Parameter(default=18)
     interp: Parameter[str] = Parameter(default="ric")
@@ -29,13 +32,14 @@ class RunMLFSM(Node):
     maxls: Parameter[int] = Parameter(default=3)
     maxiter: Parameter[int] = Parameter(default=2)
     dmax: Parameter[float] = Parameter(default=0.05)
+    outdir: Parameter[str] = Parameter(default=".")
     
-    def get_ts(fsm_string) -> ase.Atoms:
+    def get_ts(self, fsm_string) -> ase.Atoms:
         """
         Get the ase.Atoms object of the TS guess from final FSM string
         """
         path = fsm_string.r_string + fsm_string.p_string[::-1]
-        energy = np.array(self.r_energy + self.p_energy[::-1])
+        energy = np.array(fsm_string.r_energy + fsm_string.p_energy[::-1])
         energy = list(energy - energy.min())
         ts_index = energy.index(max(energy))
         return path[ts_index]
@@ -47,14 +51,13 @@ class RunMLFSM(Node):
         """
 
         #Get inputs
-        reactant = self.inp[0].recieve()
-        product = self.inp[1].recieve()
-        calculator = self.calculator.recieve()
-        outdir = self.run_directory.recieve()
+        reactant = self.reactant.receive()
+        product = self.product.receive()
+        calculator = self.calculator.receive()
         
         #Align reactant and product
         _,prod_aligned = project_trans_rot(reactant.get_positions(),product.get_positions())
-        product.set_positions(product_aligned.reshape(-1,3))
+        product.set_positions(prod_aligned.reshape(-1,3))
         
         #Set up optimizer
         optimizer = CartesianOptimizer(
@@ -81,10 +84,11 @@ class RunMLFSM(Node):
             string.write(self.outdir.value)
 
         #get TS guess geometry
-        ts_guess = get_ts(string)
+        ts_guess = self.get_ts(string)
 
         #send TS guess
-        self.out.send(ts_guess)
+        self.ts_out.send(ts_guess)
+        self.run_directory.send(self.outdir.value)
 
 
 class RunPRFO(Node):
@@ -135,14 +139,14 @@ class RunPRFO(Node):
                     'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n$molecule\nread\n$end\n'.format(self.method.value,self.basis.value))
 
     def run(self) -> None:
-        ts_guess = self.ts_guess.recieve()
+        ts_guess = self.ts_guess.receive()
         run_directory = self.run_directory.receive()
         
         num_threads = Parameter(default=8)
 
         #some calculators store charges this way
-        charge = np.sum(self.ts_guess.get_charges())
-        multiplicity = np.sum(self.ts_guess.get_magnetic_moments()) + 1
+        charge = np.sum(ts_guess.get_initial_charges())
+        multiplicity = np.sum(ts_guess.get_initial_magnetic_moments()) + 1
         filename = self.run_directory.value + "ts_guess.qcin"
         _writetsqcin(
             structure = ts_guess,
@@ -150,6 +154,6 @@ class RunPRFO(Node):
             chg = charge,
             mult = multiplicity
         )
-        os.system(f"qchem -nt {self.num_threads.value} {filename} {filename}.out
+        os.system(f"qchem -nt {self.num_threads.value} {filename} {filename}.out")
             
                      

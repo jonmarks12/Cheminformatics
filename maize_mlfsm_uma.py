@@ -2,6 +2,79 @@ from typing import Optional
 import os
 from maize.core.interface import Parameter, Output, Input
 from maize.core.node import Node
+from maize_TS_searches import RunMLFSM, RunPRFO
+
+class _FeedCalculator(Node):
+    calculator = Parameter[str]()
+    out = Output["ASECalculator"]()
+    def run(self) -> None:
+        # Load calculator
+        if self.calculator.value == "qchem":
+            from ase.calculators.qchem import QChem
+
+            calc = QChem(
+                label="fsm",
+                method="wb97x-v",
+                basis="def2-tzvp",
+                charge=chg,
+                multiplicity=mult,
+                sym_ignore="true",
+                symmetry="false",
+                scf_algorithm="diis_gdm",
+                scf_max_cycles="500",
+                nt=nt,
+            )
+        elif self.calculator.value == "xtb":
+            from xtb.ase.calculator import XTB  # type: ignore [import-not-found]
+
+            calc = XTB(method="GFN2-xTB")
+        elif self.calculator.value == "uma_s":
+            import torch
+            from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            predictor = pretrained_mlip.get_predict_unit("uma-s-1p1", device=dev)
+            calc = FAIRChemCalculator(predictor, task_name="omol")
+        elif self.calculator.value == "uma_m":
+            import torch
+            from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            predictor = pretrained_mlip.get_predict_unit("uma-m-1p1", device=dev)
+            calc = FAIRChemCalculator(predictor, task_name="omol")
+        elif self.calculator.value == "eSEN":
+            import torch
+            from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            predictor = pretrained_mlip.get_predict_unit("esen-sm-conserving-all-omol", device=dev)
+            calc = FAIRChemCalculator(predictor)
+        elif self.calculator.value == "aimnet2":
+            from aimnet2calc import AIMNet2ASE  # type: ignore [import-not-found]
+
+            calc = AIMNet2ASE("aimnet2", charge=chg, mult=mult)
+        elif self.calculator.value == "emt":
+            from ase.calculators.emt import EMT
+
+            calc = EMT()
+        elif self.calculator.value == "maceomol":
+            import torch
+            from mace.calculators import mace_omol
+
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            calc = mace_omol(model="extra_large",device=dev)
+        else:
+            raise ValueError(f"Unknown calculator {calculator}")
+        
+        self.out.send(calc)
+
+class _FeedAtoms(Node):
+    path: Parameter[str] = Parameter()
+    out: Output["ASEAtoms"] = Output()
+    def run(self) -> None:
+        from ase.io import read
+        atoms = read(self.path.value)
+        self.out.send(atoms)
 
 class OptimizeGeometryAtoms(Node):
     """
@@ -36,212 +109,11 @@ class OptimizeGeometryAtoms(Node):
         optimized = _optimize(fmax, atoms, calc)
         self.atoms_out.send(optimized)
 
-class RunMLFSM(Node):
-    """
-    Run ML-FSM (UMA-m) starting from optimized ASE Atoms.
-    """
-
-    reactant: Input["ASEAtoms"] = Input()
-    product: Input["ASEAtoms"] = Input()
-
-    # Core FSM controls
-    nnodes_min: Parameter[int] = Parameter(default=18)
-    interp: Parameter[str] = Parameter(default="ric")
-    ninterp: Parameter[int] = Parameter(default=50)
-    method: Parameter[str] = Parameter(default="L-BFGS-B")
-    maxls: Parameter[int] = Parameter(default=3)
-    maxiter: Parameter[int] = Parameter(default=2)
-    dmax: Parameter[float] = Parameter(default=0.05)
-    interpolate_only: Parameter[bool] = Parameter(default=False)
-
-    # I/O
-    workdir: Parameter[str] = Parameter(default="work_fsm")
-    vfile_dir: Output[str] = Output()
-
-    def _align_to(self, A, B):
-        """Align structure A to B via rigid transform using project_trans_rot."""
-        from mlfsm.geom import project_trans_rot
-        Apos = A.get_positions()
-        Bpos = B.get_positions()
-        _, A_aligned = project_trans_rot(Bpos, Apos)  # project A onto B frame
-        A2 = A.copy()
-        A2.set_positions(A_aligned.reshape(-1, 3))
-        return A2
-
-    def run(self) -> None:
-        import os
-        import torch
-        from fairchem.core import FAIRChemCalculator, pretrained_mlip  # type: ignore [import-not-found]
-        from mlfsm.cos import FreezingString
-        from mlfsm.opt import InternalsOptimizer
-        from ase.io import write
-
-        os.makedirs(self.workdir.value, exist_ok=True)
-        print("WORKDIR: %s",self.workdir.value)
-        vdir = self.workdir.value
-        os.makedirs(vdir, exist_ok=True)
-        self.logger.info(f"MLFSM writing outputs under: {vdir}")
-        
-        # Receive optimized endpoints
-        r = self.reactant.receive()
-        p = self.product.receive()
-
-        # Calculator (UMA-m)
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        predictor = pretrained_mlip.get_predict_unit("uma-m-1p1", device=dev)
-        calc = FAIRChemCalculator(predictor, task_name="omol")
-
-        # Align product to reactant
-        p_aligned = self._align_to(p, r)
-
-        # Build the string
-        string = FreezingString(
-            r, p,
-            int(self.nnodes_min.value),
-            str(self.interp.value),
-            int(self.ninterp.value),
-        )
-
-        if bool(self.interpolate_only.value):
-            string.interpolate(vdir)
-        else:
-            optimizer = InternalsOptimizer(
-                calc,
-                str(self.method.value),
-                int(self.maxiter.value),
-                int(self.maxls.value),
-                float(self.dmax.value),
-            )
-            #run fsm
-            while string.growing:
-                string.grow()
-                string.optimize(optimizer)
-                string.write(vdir)
-
-        self.vfile_dir.send(vdir)
-
-
-class ExtractTSFromVfiles(Node):
-    """Pick a TS guess from a directory of vfile*.xyz files.
-    Uses your read_vfile() logic on the LAST vfile (sorted order).
-    """
-    vfiles_dir_in: Input[str] = Input()
-    filename_prefix: Parameter[str] = Parameter(default="vfile")
-    filename_suffix: Parameter[str] = Parameter(default=".xyz")
-    ts_out_path: Parameter[str] = Parameter(default="ts_guess.xyz")
-    workdir: Parameter[str] = Parameter(default="work_ts")
-    ts_guess_path: Output[str] = Output()
-    ts_atoms_object: Output["ASEAtoms"] = Output()
-
-    def _read_vfile(self, path: str):
-        from ase.io import read, write  # type: ignore
-        frames = read(path, format="xyz", index=":")
-        with open(path, "r") as f:
-            data = f.readlines()
-        energies = []
-        for line in data:
-            parts = line.split()
-            if len(parts) == 2:
-                try:
-                    energies.append(float(parts[-1]))
-                except Exception:
-                    pass
-        return energies, frames
-
-    def run(self) -> None:
-        from glob import glob
-        from ase.io import write  # type: ignore
-        import os
-
-        vdir = self.vfiles_dir_in.receive()
-        os.makedirs(self.workdir.value, exist_ok=True)
-        out_path = os.path.join(self.workdir.value, os.path.basename(self.ts_out_path.value))
-
-        # Find the last vfile in sorted order
-        files = sorted(
-            f for f in glob(os.path.join(vdir, "*"))
-            if os.path.basename(f).startswith(self.filename_prefix.value)
-            and os.path.basename(f).endswith(self.filename_suffix.value)
-        )
-        if not files:
-            raise RuntimeError(f"No vfiles found in {vdir}")
-        vfile = files[-1]
-
-        energies, frames = self._read_vfile(vfile)
-        if not energies or not frames:
-            raise RuntimeError(f"Could not parse energies/frames from {vfile}")
-
-        # TS index = argmax energy
-        ts_idx = max(range(len(energies)), key=lambda i: energies[i])
-        write(out_path, frames[ts_idx])
-        self.ts_guess_path.send(out_path)
-        self.ts_atoms_object.send(frames[ts_idx])
-
-class _PrintPath(Node):
-    inp: Input[str] = Input()
-    def run(self) -> None:
-        p = self.inp.receive()
-        self.logger.info("TS guess written to: %s", p)
-
-class RunPRFO(Node):
-    import os
-    ts_guess_atoms: Input["ASEAtoms"] = Input()
-    ts_loc: Input[str] = Input()
-    ts_out: Output[str] = Output()
-        
-    def _writetsqcin(self,structure,filename,chg,mult):
-        chem_symb = structure.get_chemical_symbols()
-        #method='wb97X-V'
-        #basis='def2-TZVP'
-        method = 'B3LYP'
-        basis = '6-31g*'
-        coordinates = structure.get_positions()
-        with open(filename,'w') as f:
-            f.write(f'$molecule\n{chg} {mult}\n')
-            for i in range(len(chem_symb)):
-                f.write(chem_symb[i])
-                f.write(' ')
-                for coord in coordinates[i]:
-                    f.write(str(coord))
-                    f.write(' ')
-                f.write('\n')
-            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
-                    'basis {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n@@@\n\n'.format(method,basis))
-            f.write('$rem\nJOBTYPE       TS\nMETHOD       {}\n'
-                    'BASIS       {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\ngeom_opt_hessian read\nscf_guess read\n'
-                    'mem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS       FALSE\n$end\n\n$molecule\nread\n$end\n\n@@@\n\n'.format(method,basis))
-            f.write('$end\n\n$rem\nJOBTYPE       freq\nmethod {}\n'
-                    'basis {}\n'
-                    'scf_max_cycles 250\ngeom_opt_max_cycles 250\nmem_total 40000\nmem_static 6000\n'
-                    'WAVEFUNCTION_ANALYSIS FALSE\n$end\n\n$molecule\nread\n$end\n'.format(method,basis))
-    
-    def run(self) -> None:
-        ts_guess = self.ts_guess_atoms.receive()
-        filename = self.ts_loc.receive()
-        filename = filename+".qcin"
-        
-        self._writetsqcin(ts_guess,filename,0,1)
-        os.system(f"qchem -nt 8 {filename} {filename}.out")
-        self.ts_out.send(f'{filename}.out')
-
 
 # build and run
 if __name__ == "__main__":
     import argparse, os
     from maize.core.workflow import Workflow
-
-    # Ensure feeder exists (reads a single structure)
-    class _FeedAtoms(Node):
-        path: Parameter[str] = Parameter()
-        out: Output["ASEAtoms"] = Output()
-        def run(self) -> None:
-            from ase.io import read
-            atoms = read(self.path.value)
-            self.out.send(atoms)
 
     parser = argparse.ArgumentParser(description="MAIZE TS workflow with UMA-m and ML-FSM")
     parser.add_argument("--reactant", required=True, help="Path to reactant structure (xyz/traj)")
@@ -254,6 +126,7 @@ if __name__ == "__main__":
 
     # RunMLFSM controls
     parser.add_argument("--interp", choices=["ric","lst","cart"], default="ric")
+    parser.add_argument("--calculator", choices=["uma_s","uma_m","eSEN"], default="uma_m")
     parser.add_argument("--nnodes-min", type=int, default=18)
     parser.add_argument("--ninterp", type=int, default=50)
     parser.add_argument("--method", choices=["L-BFGS-B","CG"], default="L-BFGS-B")
@@ -261,13 +134,12 @@ if __name__ == "__main__":
     parser.add_argument("--maxiter", type=int, default=2)
     parser.add_argument("--dmax", type=float, default=0.05)
     parser.add_argument("--interpolate-only", action="store_true")
-    parser.add_argument("--vdir-name", default="fsm_outputs", help="Subdirectory name for vfile outputs")
-
+    parser.add_argument("--outdir",default=".")
     args = parser.parse_args()
 
     # Build the graph
     flow = Workflow(name="ts_search_with_mlfsm")
-
+    feedCalc = flow.add(_FeedCalculator, name = "feed_calculator", parameters=dict(calculator=args.calculator))
     feedR = flow.add(_FeedAtoms, name="feed_reactant", parameters=dict(path=args.reactant))
     feedP = flow.add(_FeedAtoms, name="feed_product", parameters=dict(path=args.product))
 
@@ -281,7 +153,6 @@ if __name__ == "__main__":
     ))
 
     mlfsm = flow.add(RunMLFSM, name="mlfsm_run", parameters=dict(
-        workdir=os.path.join(args.workdir, "fsm"),
         interp=args.interp,
         nnodes_min=args.nnodes_min,
         ninterp=args.ninterp,
@@ -289,32 +160,21 @@ if __name__ == "__main__":
         maxls=args.maxls,
         maxiter=args.maxiter,
         dmax=args.dmax,
-        interpolate_only=args.interpolate_only,
+        outdir=args.outdir
     ))
 
-    extract = flow.add(ExtractTSFromVfiles, name="extract_ts", parameters=dict(
-        workdir=os.path.join(args.workdir, "ts"),
-        ts_out_path=args.ts_out,
-    ))
-
-    printer = flow.add(_PrintPath, name="print_ts_path")
     prfo = flow.add(RunPRFO, name="run_prfo")
 
     # Wire it up
     flow.connect(feedR.out, optR.atoms_in)
     flow.connect(feedP.out, optP.atoms_in)
+    flow.connect(feedCalc.out, mlfsm.calculator)
     flow.connect(optR.atoms_out, mlfsm.reactant)
     flow.connect(optP.atoms_out, mlfsm.product)
-    flow.connect(mlfsm.vfile_dir, extract.vfiles_dir_in)
-#     flow.connect(extract.ts_guess_path, printer.inp)
-    flow.connect(extract.ts_guess_path, prfo.ts_loc)
-    flow.connect(extract.ts_atoms_object,prfo.ts_guess_atoms)
-    flow.connect(prfo.ts_out,printer.inp)
+    flow.connect(mlfsm.ts_out, prfo.ts_guess)
+    flow.connect(mlfsm.run_directory, prfo.run_directory)
 
     # Run
     flow.check()
     flow.execute()
 
-    print("=== Finished ===")
-    print(f"Vfiles directory: {os.path.join(args.workdir, 'fsm', args.vdir_name)}")
-    print(f"TS guess path:    {os.path.join(args.workdir, 'ts', os.path.basename(args.ts_out))}")

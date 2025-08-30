@@ -1,12 +1,16 @@
 from typing import Optional
 import os
-from maize.core.interface import Parameter, Output, Input
+from maize.core.interface import Parameter, Output, Input, MultiOutput
 from maize.core.node import Node
-from maize_TS_searches import RunMLFSM, RunPRFO
+#from maize_TS_searches import RunMLFSM, RunPRFO
+from maize.prebuilt.mlfsm import RunMLFSM
+from maize.prebuilt.qchem_prfo import RunPRFO
+from maize.prebuilt.sella import RunSellaTS
 
 class _FeedCalculator(Node):
     calculator = Parameter[str]()
     out = Output["ASECalculator"]()
+    out_sella = Output["ASECalculator"]()
     def run(self) -> None:
         # Load calculator
         if self.calculator.value == "qchem":
@@ -65,7 +69,8 @@ class _FeedCalculator(Node):
             calc = mace_omol(model="extra_large",device=dev)
         else:
             raise ValueError(f"Unknown calculator {calculator}")
-        
+        calc2 = calc
+        self.out_sella.send(calc2)
         self.out.send(calc)
 
 class _FeedAtoms(Node):
@@ -163,16 +168,22 @@ if __name__ == "__main__":
         outdir=args.outdir
     ))
 
-    prfo = flow.add(RunPRFO, name="run_prfo")
+    prfo = flow.add(RunPRFO, name="run_prfo", parameters=dict(method="B3LYP",basis="6-31g(d)"))
+    sella = flow.add(RunSellaTS,name="run_sella")
 
     # Wire it up
     flow.connect(feedR.out, optR.atoms_in)
     flow.connect(feedP.out, optP.atoms_in)
     flow.connect(feedCalc.out, mlfsm.calculator)
+    flow.connect(feedCalc.out_sella, sella.calculator)
     flow.connect(optR.atoms_out, mlfsm.reactant)
     flow.connect(optP.atoms_out, mlfsm.product)
-    flow.connect(mlfsm.ts_out, prfo.ts_guess)
-    flow.connect(mlfsm.run_directory, prfo.run_directory)
+    #flow.connect(mlfsm.ts_out, prfo.ts_guess)
+    #flow.connect(mlfsm.run_directory, prfo.run_directory)
+    flow.connect(mlfsm.ts_out, sella.ts_guess)
+    flow.connect(mlfsm.run_directory, sella.run_directory)
+    flow.connect(sella.ts_out_atoms, prfo.ts_guess)
+    flow.connect(sella.ts_out_loc, prfo.run_directory)
 
     # Run
     flow.check()
